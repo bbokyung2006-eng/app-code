@@ -1,0 +1,507 @@
+import React, { useState, useEffect, useCallback, useMemo } from 'react';
+import { initializeApp } from 'firebase/app';
+import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from 'firebase/auth';
+import { getFirestore, doc, setDoc, getDoc, onSnapshot, collection, query, updateDoc, increment, runTransaction, Timestamp } from 'firebase/firestore';
+import {
+  Home, BookOpen, ShoppingBag, Users, CheckCircle, Leaf, Sparkles, AlertTriangle, ArrowRight
+} from 'lucide-react';
+
+// --- 상수 및 유틸리티 ---
+
+// 사용자가 설정한 Firebase Global Variables 사용
+const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+const firebaseConfig = JSON.parse(typeof __firebase_config !== 'undefined' ? __firebase_config : '{}');
+const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+
+// 데이터베이스 경로 유틸리티
+const getUserDocRef = (db, userId) => doc(db, `/artifacts/${appId}/users/${userId}/data/stats`);
+const getLogCollectionRef = (db, userId) => collection(db, `/artifacts/${appId}/users/${userId}/daily_log`);
+
+const TODAY = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
+
+// 기본 미션 및 통계 구조
+const INITIAL_STATS = {
+  points: 0,
+  credits: 0,
+  gardenLevel: 1, // 버추얼 가든 레벨 (성장 단계)
+  lastLogin: TODAY,
+  weeklyQuestProgress: 0,
+};
+
+const DAILY_MISSIONS = [
+  { id: 'sunlight', name: '창문 5분 열기', points: 10, difficulty: 1, required: false },
+  { id: 'water', name: '물 한 잔 마시기', points: 5, difficulty: 1, required: false },
+  { id: 'clean', name: '옷 1개 개기', points: 15, difficulty: 2, required: false },
+  { id: 'micro_study', name: '마이크로 학습 챌린지 1회', points: 20, difficulty: 2, required: true },
+  { id: 'checkin', name: '익명 체크인 포스트 작성', points: 10, difficulty: 1, required: false },
+];
+
+const WEEKLY_QUESTS = [
+  { id: 'w_study', name: '마이크로 학습 5회 성공', progressKey: 'micro_study_count', target: 5 },
+  { id: 'w_outing', name: '외출(걸음 수) 1회 기록', progressKey: 'outing_count', target: 1 },
+  { id: 'w_contact', name: '연락 시도(격려 사서함) 1회', progressKey: 'contact_count', target: 1 },
+  { id: 'w_rhythm', name: '생활 리듬 체크 3일 성공', progressKey: 'rhythm_success_count', target: 3 },
+];
+
+const GARDEN_LEVELS = [
+  { level: 1, name: '새싹', growthThreshold: 0, color: 'text-green-500' },
+  { level: 2, name: '작은 줄기', growthThreshold: 100, color: 'text-green-600' },
+  { level: 3, name: '튼튼한 나무', growthThreshold: 300, color: 'text-lime-700' },
+  { level: 4, name: '풍성한 열매', growthThreshold: 600, color: 'text-yellow-600' },
+];
+
+const COUPONS = [
+  { id: 'coffee', name: '편의점 커피 교환권', cost: 1, description: '가까운 편의점에서 따뜻한 커피 한 잔과 재도약의 용기를 얻으세요.' },
+  { id: 'book', name: '서점 상품권 (5,000원)', cost: 3, description: '새로운 지식이나 흥미를 위한 책을 한 권 구매해 보세요.' },
+  { id: 'movie', name: '영화 관람권 (1인)', cost: 5, description: '잠시 세상 밖으로 나와 영화 한 편을 즐겨보세요.' },
+];
+
+// --- Firebase Custom Hook ---
+
+const useFirebaseInit = () => {
+  const [db, setDb] = useState(null);
+  const [auth, setAuth] = useState(null);
+  const [userId, setUserId] = useState(null);
+  const [isAuthReady, setIsAuthReady] = useState(false);
+
+  useEffect(() => {
+    try {
+      if (Object.keys(firebaseConfig).length === 0) {
+        console.error("Firebase config is missing.");
+        setIsAuthReady(true);
+        return;
+      }
+
+      const app = initializeApp(firebaseConfig);
+      const firestoreDb = getFirestore(app);
+      const firebaseAuth = getAuth(app);
+      setDb(firestoreDb);
+      setAuth(firebaseAuth);
+      
+      // Setting Firestore log level to Debug to assist in environment where it's needed
+      // setLogLevel('Debug');
+
+      const unsubscribe = onAuthStateChanged(firebaseAuth, async (user) => {
+        if (user) {
+          setUserId(user.uid);
+        } else {
+          try {
+            if (initialAuthToken) {
+              await signInWithCustomToken(firebaseAuth, initialAuthToken);
+            } else {
+              await signInAnonymously(firebaseAuth);
+            }
+          } catch (error) {
+            console.error("Sign-in failed. Using temporary ID:", error);
+            setUserId(crypto.randomUUID());
+          }
+        }
+        setIsAuthReady(true);
+      });
+
+      return () => unsubscribe();
+    } catch (error) {
+      console.error("Firebase initialization error:", error);
+      setIsAuthReady(true);
+    }
+  }, []);
+
+  return { db, userId, isAuthReady };
+};
+
+// --- App Component ---
+
+const App = () => {
+  const { db, userId, isAuthReady } = useFirebaseInit();
+  const [currentPage, setCurrentPage] = useState('home');
+  const [userStats, setUserStats] = useState(INITIAL_STATS);
+  const [dailyLog, setDailyLog] = useState({});
+  const [isLoading, setIsLoading] = useState(true);
+  const [message, setMessage] = useState('');
+  const [musicMessage, setMusicMessage] = useState('');
+
+  // 1. 데이터 로딩 및 동기화 (onSnapshot)
+  useEffect(() => {
+    if (!isAuthReady || !db || !userId) return;
+
+    // 사용자 통계 (Points, Credits, Garden Level) 동기화
+    const statsRef = getUserDocRef(db, userId);
+    
+    // **FIX: 1. Ensure User Stats Document Exists**
+    // setDoc with merge: true will create the document if it doesn't exist 
+    // and initialize it with INITIAL_STATS, without overwriting existing data if it does.
+    setDoc(statsRef, INITIAL_STATS, { merge: true })
+        .catch(err => console.error("Failed to initialize user stats document:", err));
+
+    const unsubscribeStats = onSnapshot(statsRef, (docSnap) => {
+      const data = docSnap.exists() ? docSnap.data() : INITIAL_STATS;
+      
+      // 일일 초기화 확인 로직
+      if (data.lastLogin !== TODAY) {
+        // 날짜가 바뀌었으면 일일 미션 로그 초기화
+        setDailyLog({});
+        // lastLogin 업데이트 및 주간 퀘스트 카운트 초기화 (필요시)
+        updateDoc(statsRef, {
+            lastLogin: TODAY
+        }).catch(err => console.error("Failed to update last login:", err));
+      }
+      
+      setUserStats(prev => ({ ...INITIAL_STATS, ...data }));
+      setIsLoading(false);
+    }, (error) => {
+      console.error("Error fetching stats:", error);
+      setIsLoading(false);
+    });
+
+    // 오늘 날짜의 일일 로그 동기화
+    const logRef = doc(getLogCollectionRef(db, userId), TODAY);
+    const unsubscribeLog = onSnapshot(logRef, (docSnap) => {
+        setDailyLog(docSnap.exists() ? docSnap.data() : {});
+    }, (error) => {
+        console.error("Error fetching daily log:", error);
+    });
+
+    return () => {
+      unsubscribeStats();
+      unsubscribeLog();
+    };
+  }, [db, userId, isAuthReady]);
+
+  // 2. 미션 완료 및 보상 처리 로직
+  const handleMissionComplete = useCallback(async (missionId) => {
+    if (!db || !userId) {
+        setMessage('인증 상태를 확인 중입니다...');
+        return;
+    }
+
+    const mission = DAILY_MISSIONS.find(m => m.id === missionId);
+    if (!mission) return;
+
+    const statsRef = getUserDocRef(db, userId);
+    const logRef = doc(getLogCollectionRef(db, userId), TODAY);
+    const logKey = `mission_${missionId}_completed`;
+
+    try {
+        await runTransaction(db, async (transaction) => {
+            const logDoc = await transaction.get(logRef);
+            if (logDoc.exists() && logDoc.data()[logKey]) {
+                setMessage(`"${mission.name}" 미션은 이미 완료했습니다.`);
+                return;
+            }
+
+            // 1. Daily Log 업데이트 (미션 완료 표시)
+            transaction.set(logRef, { 
+                [logKey]: true,
+                completedAt: Timestamp.now(),
+            }, { merge: true });
+
+            // 2. User Stats 업데이트 (포인트 증가)
+            // statsRef는 useEffect에서 setDoc으로 존재가 보장되었으므로 update를 사용합니다.
+            transaction.update(statsRef, {
+                points: increment(mission.points),
+                // 주간 퀘스트 진행 카운트 (예시: 마이크로 학습은 주간 퀘스트에 포함)
+                weeklyQuestProgress: increment(mission.required ? 1 : 0) // 예시로 required 미션만 카운트
+            });
+            
+            setMessage(`${mission.name} 성공! 재도약 포인트 ${mission.points}점 획득!`);
+        });
+
+        // 3. 주간 퀘스트 완료 여부 확인 (트랜잭션 밖에서 처리)
+        // 실제 구현에서는 주간 퀘스트의 복잡한 조건(외출, 연락 등)을 별도의 카운터로 관리해야 함.
+        // 여기서는 단순화하여 weeklyQuestProgress가 일정 임계값을 넘으면 크레딧을 지급한다고 가정.
+        const weeklyTarget = WEEKLY_QUESTS.length * 5; // 임의의 주간 목표 설정
+        if (userStats.weeklyQuestProgress + (mission.required ? 1 : 0) >= weeklyTarget) {
+            await updateDoc(statsRef, {
+                credits: increment(1),
+                weeklyQuestProgress: 0, // 초기화
+            });
+            setMessage(prev => prev + ' 주간 퀘스트 4개 모두 성공! 재도약 크레딧 1개 획득!');
+        }
+
+    } catch (error) {
+        console.error("Mission completion failed:", error);
+        setMessage('미션 완료 중 오류가 발생했습니다.');
+    }
+  }, [db, userId, userStats.weeklyQuestProgress]);
+
+  // 3. 상점 - 쿠폰 구매 로직
+  const handleCouponPurchase = useCallback(async (coupon) => {
+    if (!db || !userId) return;
+    if (userStats.credits < coupon.cost) {
+      setMessage('크레딧이 부족합니다!');
+      return;
+    }
+
+    const statsRef = getUserDocRef(db, userId);
+
+    try {
+        await runTransaction(db, async (transaction) => {
+            const docSnap = await transaction.get(statsRef);
+            const currentCredits = docSnap.data().credits;
+            
+            if (currentCredits < coupon.cost) {
+                // 이중 체크
+                throw new Error("Credit insufficient during transaction.");
+            }
+            
+            // 1. 크레딧 차감
+            // statsRef는 useEffect에서 setDoc으로 존재가 보장되었으므로 update를 사용합니다.
+            transaction.update(statsRef, {
+                credits: increment(-coupon.cost),
+            });
+
+            // 2. 쿠폰 발급 기록 (실제 구현에서는 쿠폰 사용 추적을 위한 별도 컬렉션 필요)
+            // 여기서는 임시로 메시지로 대체
+        });
+        setMessage(`${coupon.name} 구매 완료! 실물 쿠폰 사용을 위해 집 밖으로 나갈 용기를 내보세요!`);
+    } catch (error) {
+        console.error("Coupon purchase failed:", error);
+        setMessage('쿠폰 구매 중 오류가 발생했습니다: ' + error.message);
+    }
+  }, [db, userId, userStats.credits]);
+
+  // 4. 오늘의 긍정 메시지 및 음악 추천 (LLM API 호출 시뮬레이션)
+  useEffect(() => {
+    // 긍정 메시지 및 음악은 앱 접속 시 한 번만 호출
+    const messages = [
+        "오늘의 작은 움직임이 내일의 큰 변화를 만듭니다.",
+        "당신이 멈춰있던 시간은 재도약을 위한 준비 기간이었습니다.",
+        "괜찮아요. 지금 이 순간부터 다시 시작하면 됩니다.",
+        "가장 힘든 일은 시작하는 것이다. 당신은 이미 시작했습니다.",
+        "당신의 속도로 가세요. 늦어도 괜찮습니다."
+    ];
+    setMessage(messages[Math.floor(Math.random() * messages.length)]);
+    setMusicMessage('오늘은 편안하고 차분한 Lo-Fi 플레이리스트를 추천합니다.');
+    
+    // 실제 LLM API 호출 코드가 들어갈 위치:
+    /*
+    const fetchAIText = async (prompt, setStateFunc) => {
+        // ... API 호출 및 응답 처리 로직 (Google Search grounding X)
+    }
+    fetchAIText("랜덤으로 긍정적이고 희망적인 문구 하나만 추천해줘", setMessage);
+    fetchAIText("기분 좋아지고 안정감 주는 노래 한 곡 추천하고 제목만 알려줘", setMusicMessage);
+    */
+  }, []);
+
+  // 5. 버추얼 가든 레벨 계산
+  const gardenInfo = useMemo(() => {
+    const totalPoints = userStats.points;
+    let currentLevel = GARDEN_LEVELS[0];
+    let nextLevel = null;
+
+    for (let i = 0; i < GARDEN_LEVELS.length; i++) {
+      if (totalPoints >= GARDEN_LEVELS[i].growthThreshold) {
+        currentLevel = GARDEN_LEVELS[i];
+      } else {
+        nextLevel = GARDEN_LEVELS[i];
+        break;
+      }
+    }
+
+    const progress = nextLevel
+      ? ((totalPoints - currentLevel.growthThreshold) / (nextLevel.growthThreshold - currentLevel.growthThreshold)) * 100
+      : 100;
+
+    return { currentLevel, nextLevel, progress: Math.min(progress, 100) };
+  }, [userStats.points]);
+
+  // --- UI Components ---
+
+  const Header = () => (
+    <div className="flex justify-between items-center p-4 border-b border-gray-100 bg-white">
+      <h1 className="text-xl font-bold text-gray-800">Re:Start</h1>
+      <div className="flex items-center space-x-3 text-sm font-medium">
+        <Sparkles className="w-5 h-5 text-yellow-500" />
+        <span className="text-gray-700">P: {userStats.points}</span>
+        <ShoppingBag className="w-5 h-5 text-blue-500" />
+        <span className="text-gray-700">C: {userStats.credits}</span>
+      </div>
+    </div>
+  );
+
+  const MessageBanner = ({ text, type = 'info' }) => {
+    if (!text) return null;
+    const color = type === 'info' ? 'bg-indigo-50 border-indigo-200 text-indigo-700' : 'bg-green-50 border-green-200 text-green-700';
+    return (
+      <div className={`p-3 mx-4 mt-4 rounded-lg border text-sm font-medium ${color}`}>
+        {text}
+      </div>
+    );
+  };
+
+  const Card = ({ children, title, icon: Icon }) => (
+    <div className="bg-white p-5 rounded-xl shadow-lg border border-gray-100">
+      <div className="flex items-center mb-3">
+        {Icon && <Icon className="w-5 h-5 mr-2 text-indigo-500" />}
+        <h2 className="text-lg font-semibold text-gray-800">{title}</h2>
+      </div>
+      {children}
+    </div>
+  );
+
+  const HomeView = () => {
+    const { currentLevel, nextLevel, progress } = gardenInfo;
+
+    return (
+      <div className="space-y-6 p-4">
+        <MessageBanner text={`"${message}"`} type="info" />
+        
+        {/* 멘탈 지원 기능 */}
+        <Card title="기분 전환하기" icon={Sparkles}>
+          <p className="text-sm text-gray-600 mb-2">
+            **오늘의 긍정 메시지:** <span className="font-semibold text-indigo-600">{message}</span>
+          </p>
+          <div className="flex items-center text-sm text-gray-600">
+            <span className="mr-2">🎶 **추천 음악:**</span>
+            <span className="font-medium">{musicMessage}</span>
+          </div>
+        </Card>
+
+        {/* 버추얼 가든 */}
+        <Card title="버추얼 가든 (나의 회복 단계)" icon={Leaf}>
+          <div className="flex flex-col items-center py-4">
+            <span className={`text-5xl mb-2 ${currentLevel.color}`}>
+              {currentLevel.level === 1 ? '🌱' : currentLevel.level === 2 ? '🌿' : currentLevel.level === 3 ? '🌳' : '🍎'}
+            </span>
+            <p className="text-xl font-bold">{currentLevel.name}</p>
+            <p className="text-sm text-gray-500 mt-1">
+              {nextLevel ? `다음 레벨(${nextLevel.name})까지 ${nextLevel.growthThreshold - userStats.points} P 남음` : '최고 레벨 달성!'}
+            </p>
+            <div className="w-full bg-gray-200 rounded-full h-2.5 mt-3">
+              <div className="bg-green-500 h-2.5 rounded-full transition-all duration-500" style={{ width: `${progress}%` }}></div>
+            </div>
+          </div>
+        </Card>
+
+        {/* 오늘의 미션 */}
+        <Card title="데일리 미션: 스몰 액션" icon={CheckCircle}>
+          <ul className="space-y-3">
+            {DAILY_MISSIONS.map((m) => {
+              const isCompleted = dailyLog[`mission_${m.id}_completed`];
+              return (
+                <li key={m.id} className={`flex justify-between items-center p-3 rounded-lg transition-colors ${isCompleted ? 'bg-green-50' : 'bg-gray-50 hover:bg-gray-100'}`}>
+                  <span className={`flex-1 font-medium ${isCompleted ? 'line-through text-gray-500' : 'text-gray-800'}`}>
+                    {m.name}
+                  </span>
+                  <div className="flex items-center space-x-2">
+                    <span className="text-xs font-semibold text-indigo-600">+{m.points} P</span>
+                    <button
+                      onClick={() => handleMissionComplete(m.id)}
+                      disabled={isCompleted}
+                      className={`px-3 py-1 text-xs rounded-full transition-all ${isCompleted ? 'bg-green-500 text-white cursor-default' : 'bg-indigo-500 text-white hover:bg-indigo-600'}`}
+                    >
+                      {isCompleted ? '완료됨' : '도전!'}
+                    </button>
+                  </div>
+                </li>
+              );
+            })}
+          </ul>
+        </Card>
+      </div>
+    );
+  };
+
+  const StudyView = () => (
+    <div className="p-4 space-y-6">
+      <h2 className="text-2xl font-bold text-gray-800">학습 지원: 재도약을 위한 도약</h2>
+      
+      <Card title="마이크로 스킬 챌린지" icon={BookOpen}>
+        <p className="text-sm text-gray-600 mb-4">5분~10분 분량의 초단기 학습 챌린지에 도전해보세요. (미션 완료는 홈 화면에서 가능합니다)</p>
+        <div className="bg-yellow-50 p-4 rounded-lg border border-yellow-200">
+          <p className="font-medium text-yellow-800">오늘의 챌린지:</p>
+          <p className="text-sm text-gray-700 mt-1">기초 영어 단어 3개 (focus, effort, restart) 학습하고 인증하기</p>
+        </div>
+      </Card>
+      
+      <Card title="랜덤 학습 짝궁 (Silent Co-Study)" icon={Users}>
+        <p className="text-sm text-gray-600 mb-4">익명의 다른 사용자와 함께 방해 없이 타이머만 공유하며 공부합니다. 채팅/화상 연결은 없습니다. 외롭지 않은 집중을 경험하세요.</p>
+        <button className="w-full py-2 bg-pink-500 text-white font-bold rounded-lg hover:bg-pink-600 transition-colors">
+          짝궁 찾고 타이머 시작
+        </button>
+      </Card>
+    </div>
+  );
+
+  const ShopView = () => (
+    <div className="p-4 space-y-6">
+      <h2 className="text-2xl font-bold text-gray-800">오프라인 쿠폰 상점 (C: {userStats.credits})</h2>
+      <MessageBanner text="주간 퀘스트를 성공하여 크레딧을 모으고, 쿠폰으로 '바깥 활동'에 필요한 용기를 얻으세요!" type="info" />
+
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+        {COUPONS.map(c => (
+          <div key={c.id} className="bg-white p-5 rounded-xl shadow-lg border border-indigo-200">
+            <h3 className="text-xl font-bold text-indigo-700">{c.name}</h3>
+            <p className="text-sm text-gray-500 mt-1 mb-3">{c.description}</p>
+            <div className="flex justify-between items-center pt-3 border-t border-dashed border-indigo-100">
+              <span className="text-2xl font-extrabold text-blue-600">
+                {c.cost} C
+              </span>
+              <button
+                onClick={() => handleCouponPurchase(c)}
+                disabled={userStats.credits < c.cost}
+                className={`flex items-center px-4 py-2 text-sm font-bold rounded-lg transition-colors ${userStats.credits >= c.cost ? 'bg-blue-500 text-white hover:bg-blue-600' : 'bg-gray-300 text-gray-500 cursor-not-allowed'}`}
+              >
+                <ShoppingBag className="w-4 h-4 mr-1" />
+                구매하기
+              </button>
+            </div>
+          </div>
+        ))}
+      </div>
+      <div className="p-4 bg-gray-100 rounded-lg text-sm text-gray-600">
+        <p className="font-semibold mb-1">💡 나의 현재 크레딧: {userStats.credits} C</p>
+        <p>크레딧은 **주간 퀘스트** 4개를 모두 달성할 때마다 1개씩 지급됩니다.</p>
+      </div>
+    </div>
+  );
+  
+  const NavigationView = ({ current }) => {
+      const items = [
+          { name: '홈', icon: Home, page: 'home' },
+          { name: '학습', icon: BookOpen, page: 'study' },
+          { name: '상점', icon: ShoppingBag, page: 'shop' },
+          // { name: '커뮤니티', icon: Users, page: 'community' }, // 익명 체크인 기능은 추후 구현
+      ];
+
+      return (
+          <div className="fixed bottom-0 left-0 right-0 bg-white border-t border-gray-100 shadow-xl flex justify-around p-2">
+              {items.map(item => (
+                  <button
+                      key={item.page}
+                      onClick={() => setCurrentPage(item.page)}
+                      className={`flex flex-col items-center p-2 rounded-lg transition-colors ${current === item.page ? 'text-indigo-600' : 'text-gray-500 hover:text-indigo-400'}`}
+                  >
+                      <item.icon className="w-6 h-6" />
+                      <span className="text-xs mt-1">{item.name}</span>
+                  </button>
+              ))}
+          </div>
+      );
+  };
+
+
+  if (!isAuthReady) {
+    return (
+      <div className="flex items-center justify-center min-h-screen bg-gray-50">
+        <p className="text-gray-600">데이터 로딩 중... 잠시만 기다려 주세요.</p>
+      </div>
+    );
+  }
+
+  // --- Main Render ---
+  return (
+    <div className="min-h-screen bg-gray-50 pb-20">
+      <Header />
+      <div className="max-w-xl mx-auto">
+        {currentPage === 'home' && <HomeView />}
+        {currentPage === 'study' && <StudyView />}
+        {currentPage === 'shop' && <ShopView />}
+        {/* 커뮤니티 페이지는 HomeView의 메시지/음악 추천으로 일부분 대체 */}
+      </div>
+      <NavigationView current={currentPage} />
+    </div>
+  );
+};
+
+export default App;
